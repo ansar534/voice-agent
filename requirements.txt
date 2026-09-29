@@ -1,0 +1,46 @@
+# FastAPI — async REST API that exposes chat, history, appointments, and analytics.
+fastapi>=0.115.6
+
+# uvicorn — ASGI server that runs the FastAPI app (the [standard] extra adds httptools and websockets).
+uvicorn[standard]>=0.34.0
+
+# python-dotenv — loads GROQ_API_KEY and other settings from .env into the process environment.
+python-dotenv>=1.0.1
+
+# pydantic — request and response validation models for every API payload.
+pydantic>=2.10.0
+
+# LangChain — LLM client wrappers and the @tool decorator used by the agent tools.
+langchain>=0.3.14
+langchain-core>=0.3.28
+
+# langchain-groq — Groq chat model (llama-3.1-8b-instruct) behind the LangChain interface.
+langchain-groq>=0.2.3
+
+# langchain-community — extra LangChain integrations (document loaders and utilities).
+langchain-community>=0.3.14
+
+# langchain-text-splitters — splits knowledge-base documents into overlapping chunks.
+langchain-text-splitters>=0.3.4
+
+# LangGraph — stateful graph that routes each turn through intent, retrieval, and tools.
+langgraph>=0.2.62
+
+# ChromaDB — local persistent vector database for semantic search.
+chromadb>=0.6.3
+
+# sentence-transformers — local embedding model (all-MiniLM-L6-v2); no embedding API key required.
+sentence-transformers>=3.3.1
+
+# rank-bm25 — keyword ranking so retrieval can combine semantic and exact-term matches.
+rank-bm25>=0.2.2
+
+# pypdf — reads PDF files in the knowledge base during ingestion.
+pypdf>=5.1.0
+
+# Streamlit — dark-themed dashboard for chat and analytics.
+streamlit>=1.41.1
+
+# pytest + httpx — agent tests and the FastAPI test client.
+pytest>=8.3.4
+httpx>=0.28.0

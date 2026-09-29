@@ -1,0 +1,22 @@
+City Medical Clinic — How Appointment Booking Works
+
+Information required to book
+To book an appointment the receptionist needs the patient's full name, a callback phone number, the reason for the visit, a preferred date, and a preferred time. New patients also need their date of birth. A booking is not final until the receptionist repeats the name, date, time, and reason and the patient confirms them.
+
+Visit lengths
+A standard follow-up or sick visit is 20 minutes. A new-patient visit or annual physical is 40 minutes. Well-child visits are 30 minutes. Only one concern is scheduled per sick visit. If you need a physical and a new problem addressed, book two separate appointments.
+
+How available times are offered
+The receptionist offers open times on the requested date. Morning appointments start at 8:00 AM, 8:30 AM, 9:00 AM, 9:30 AM, 10:00 AM, and 10:30 AM. Afternoon appointments start at 1:00 PM, 1:30 PM, 2:00 PM, 2:30 PM, 3:00 PM, 3:30 PM, and 4:00 PM. Saturday slots, when the clinic is open, are 9:00 AM, 10:00 AM, 11:00 AM, and 12:00 PM. If the requested time is taken, the receptionist offers the nearest open slot on that day before suggesting another date.
+
+Same-day visits
+A limited number of same-day sick slots open at 7:30 AM on weekdays. They are for new symptoms that started within the last few days. Same-day slots cannot be used for physicals, paperwork, or routine follow-up.
+
+Confirmation
+After the patient confirms the details, the receptionist saves the booking and gives a confirmation that includes a booking ID. A reminder call is placed one business day before the visit. Patients should call back if any detail in the confirmation is wrong.
+
+Changing or canceling
+Appointments can be moved or canceled up to 24 hours before the start time with no fee. Changes inside 24 hours follow the late-cancel policy in the clinic policies. To change a visit, the patient gives their name and the current date and time of the appointment.
+
+What the receptionist cannot book
+The receptionist does not book procedures that a clinician has not ordered, does not promise a specific clinician unless that clinician has an open slot, and does not book visits for problems that belong in the emergency department. Those callers are told to call 911.

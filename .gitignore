@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.chroma_cache/
+chroma_db/
+*.egg-info/
+appointments.json
+escalations.json
