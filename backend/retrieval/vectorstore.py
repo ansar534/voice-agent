@@ -1,359 +1,265 @@
-"""Hybrid retrieval over the local Chroma and BM25 indexes.
+"""Hybrid retrieval combining ChromaDB semantic search with BM25 keywords.
 
-A query is embedded with the same all-MiniLM-L6-v2 model used at ingest
-time, then matched two ways:
-
-* Chroma semantic search, ranked by cosine similarity
-* BM25 keyword search, ranked by term overlap
-
-The two lists are merged with reciprocal rank fusion and de-duplicated by
-chunk id. Confidence is the cosine similarity of the top merged chunk,
-clamped to the range 0 to 1.
+Semantic search catches paraphrases; BM25 catches exact terms like a fee
+amount or a policy name. Blending both is more reliable than either alone.
 """
 
 from __future__ import annotations
 
 import logging
 import pickle
-import time
-from dataclasses import dataclass
 
 import chromadb
 import numpy as np
-from chromadb.api.models.Collection import Collection
-from chromadb.errors import NotFoundError
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-from backend.config import settings
-from backend.retrieval.ingest import tokenize
+from ..config import (
+    BM25_INDEX_PATH,
+    BM25_WEIGHT,
+    CHROMA_PERSIST_DIR,
+    COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    SEMANTIC_WEIGHT,
+)
+from .ingest import tokenize
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOP_K = 5
-# Standard reciprocal-rank-fusion constant. Higher k makes ranks flatter.
-RRF_K = 60
 
-_model: SentenceTransformer | None = None
-_chroma_client: chromadb.PersistentClient | None = None
-_bm25_cache: tuple[float, BM25Okapi, list[dict[str, str | int]]] | None = None
+class HybridRetriever:
+    """Searches the knowledge base semantically and by keyword at once."""
 
+    def __init__(self) -> None:
+        """Load the Chroma collection, the BM25 index, and the embedder.
 
-@dataclass(frozen=True)
-class RetrievedChunk:
-    """One knowledge-base chunk chosen by hybrid search."""
+        Raises FileNotFoundError when either index is missing, which means
+        ingestion has not been run yet.
+        """
+        if not CHROMA_PERSIST_DIR.is_dir():
+            raise FileNotFoundError(
+                f"No ChromaDB at {CHROMA_PERSIST_DIR}. Run: python -m backend.retrieval.ingest"
+            )
 
-    id: str
-    text: str
-    source: str
-    chunk_index: int
-    cosine_similarity: float
-    bm25_score: float
-    fusion_score: float
-
-
-@dataclass(frozen=True)
-class HybridSearchResult:
-    """Merged chunks plus how well the top chunk matches the query."""
-
-    chunks: list[RetrievedChunk]
-    confidence: float
-
-
-@dataclass
-class _Candidate:
-    """Working record while semantic and keyword hits are combined."""
-
-    id: str
-    text: str
-    source: str
-    chunk_index: int
-    cosine_similarity: float = 0.0
-    bm25_score: float = 0.0
-    semantic_rank: int | None = None
-    bm25_rank: int | None = None
-
-
-def _get_model() -> SentenceTransformer:
-    """Load all-MiniLM-L6-v2 once and reuse it for later queries."""
-    global _model
-    if _model is None:
+        client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
         try:
-            _model = SentenceTransformer(settings.embedding_model_name)
+            self.collection = client.get_collection(COLLECTION_NAME)
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to load embedding model {settings.embedding_model_name}: {exc}"
+            raise FileNotFoundError(
+                f"Collection '{COLLECTION_NAME}' not found. "
+                "Run: python -m backend.retrieval.ingest"
             ) from exc
-        logger.info("Loaded embedding model %s", settings.embedding_model_name)
-    return _model
 
+        if not BM25_INDEX_PATH.is_file():
+            raise FileNotFoundError(
+                f"No BM25 index at {BM25_INDEX_PATH}. Run: python -m backend.retrieval.ingest"
+            )
+        with BM25_INDEX_PATH.open("rb") as handle:
+            payload = pickle.load(handle)
 
-def _embed_query(query: str) -> np.ndarray:
-    """Embed one query with the same normalization used at ingest time."""
-    try:
-        vector = _get_model().encode(
-            [query],
+        # Rebuild from the stored corpus so the index does not depend on
+        # the exact rank_bm25 version that pickled it.
+        self.bm25_texts: list[str] = payload["texts"]
+        self.bm25_sources: list[str] = payload["sources"]
+        self.bm25 = BM25Okapi(payload["tokenized_corpus"])
+
+        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        logger.info(
+            "HybridRetriever ready: %d chunk(s) in Chroma, %d in BM25",
+            self.collection.count(),
+            len(self.bm25_texts),
+        )
+
+    def embed(self, text: str) -> np.ndarray:
+        """Embed a single string into a normalized vector."""
+        vector = self.model.encode(
+            [text],
             normalize_embeddings=True,
             show_progress_bar=False,
             convert_to_numpy=True,
         )[0]
-    except Exception as exc:
-        raise RuntimeError(f"Failed to embed query: {exc}") from exc
-    return np.asarray(vector, dtype=np.float32)
+        return np.asarray(vector, dtype=np.float32)
 
+    def compute_confidence(self, query: str, top_chunk: str) -> float:
+        """Return cosine similarity between a query and a chunk, 0 to 1.
 
-def _get_collection() -> Collection:
-    """Open the persisted Chroma collection created by ingestion."""
-    global _chroma_client
-    if not settings.chroma_persist_dir.is_dir():
-        raise FileNotFoundError(
-            f"Chroma directory not found at {settings.chroma_persist_dir}. "
-            "Run ingestion first."
-        )
-    if _chroma_client is None:
-        _chroma_client = chromadb.PersistentClient(path=str(settings.chroma_persist_dir))
-    try:
-        collection = _chroma_client.get_collection(settings.collection_name)
-    except NotFoundError as exc:
-        raise FileNotFoundError(
-            f"Chroma collection '{settings.collection_name}' does not exist. "
-            "Run ingestion first."
-        ) from exc
-    if collection.count() == 0:
-        raise ValueError(
-            f"Chroma collection '{settings.collection_name}' is empty. "
-            "Run ingestion first."
-        )
-    return collection
+        Both vectors are unit length, so their dot product is the cosine.
+        Negative values are clamped to 0 because the agent treats this
+        number as a confidence score.
+        """
+        if not query.strip() or not top_chunk.strip():
+            return 0.0
+        try:
+            similarity = float(np.dot(self.embed(query), self.embed(top_chunk)))
+        except Exception as exc:
+            logger.error("Confidence computation failed: %s", exc)
+            return 0.0
+        return max(0.0, min(1.0, similarity))
 
+    def _semantic_search(self, query: str, n_results: int) -> list[dict[str, object]]:
+        """Return the nearest chunks from ChromaDB with scores in 0 to 1."""
+        count = self.collection.count()
+        if count == 0:
+            return []
 
-def _load_bm25() -> tuple[BM25Okapi, list[dict[str, str | int]]]:
-    """Load the BM25 corpus, rebuilding the index when the pickle changes."""
-    global _bm25_cache
-    path = settings.bm25_index_path
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"BM25 index not found at {path}. Run ingestion first."
-        )
-    mtime = path.stat().st_mtime
-    if _bm25_cache is not None and _bm25_cache[0] == mtime:
-        return _bm25_cache[1], _bm25_cache[2]
-
-    with path.open("rb") as handle:
-        payload = pickle.load(handle)
-    chunks = payload.get("chunks") or []
-    tokenized = payload.get("tokenized_corpus") or []
-    if not chunks or not tokenized or len(chunks) != len(tokenized):
-        raise ValueError(f"BM25 index at {path} is empty or malformed.")
-    index = BM25Okapi(tokenized)
-    _bm25_cache = (mtime, index, chunks)
-    logger.info("Loaded BM25 index with %d chunk(s) from %s", len(chunks), path)
-    return index, chunks
-
-
-def _clamp_unit(value: float) -> float:
-    """Clamp a similarity into the 0 to 1 range the agent treats as confidence."""
-    return max(0.0, min(1.0, float(value)))
-
-
-def _cosine_by_id(
-    collection: Collection,
-    query_vector: np.ndarray,
-    chunk_ids: list[str],
-) -> dict[str, float]:
-    """Return cosine similarity between the query and each stored chunk.
-
-    Ingest stores L2-normalized embeddings, so the dot product is cosine
-    similarity. Negative values are clamped to 0.
-    """
-    if not chunk_ids:
-        return {}
-    stored = collection.get(ids=chunk_ids, include=["embeddings"])
-    similarities: dict[str, float] = {}
-    embeddings = stored.get("embeddings")
-    if embeddings is None:
-        return similarities
-    for chunk_id, embedding in zip(stored.get("ids") or [], embeddings):
-        if embedding is None:
-            continue
-        vector = np.asarray(embedding, dtype=np.float32)
-        similarities[str(chunk_id)] = _clamp_unit(float(np.dot(query_vector, vector)))
-    return similarities
-
-
-def semantic_search(
-    query_vector: np.ndarray,
-    collection: Collection,
-    top_k: int,
-) -> list[_Candidate]:
-    """Return the nearest Chroma chunks for an already embedded query."""
-    result_count = min(top_k, collection.count())
-    try:
-        result = collection.query(
-            query_embeddings=[query_vector.tolist()],
-            n_results=result_count,
+        result = self.collection.query(
+            query_embeddings=[self.embed(query).tolist()],
+            n_results=min(n_results, count),
             include=["documents", "metadatas", "distances"],
         )
-    except Exception as exc:
-        raise RuntimeError(f"Chroma semantic search failed: {exc}") from exc
+        documents = (result.get("documents") or [[]])[0]
+        metadatas = (result.get("metadatas") or [[]])[0]
+        distances = (result.get("distances") or [[]])[0]
 
-    ids = (result.get("ids") or [[]])[0]
-    documents = (result.get("documents") or [[]])[0]
-    metadatas = (result.get("metadatas") or [[]])[0]
-    if not ids:
-        return []
-
-    cosine = _cosine_by_id(collection, query_vector, [str(chunk_id) for chunk_id in ids])
-    candidates: list[_Candidate] = []
-    for rank, chunk_id in enumerate(ids, start=1):
-        position = rank - 1
-        metadata = metadatas[position] or {}
-        candidates.append(
-            _Candidate(
-                id=str(chunk_id),
-                text=str(documents[position] or ""),
-                source=str(metadata.get("source", "")),
-                chunk_index=int(metadata.get("chunk_index", 0)),
-                cosine_similarity=cosine.get(str(chunk_id), 0.0),
-                semantic_rank=rank,
+        hits: list[dict[str, object]] = []
+        for text, metadata, distance in zip(documents, metadatas, distances):
+            # The collection uses cosine space, so distance = 1 - similarity.
+            score = max(0.0, min(1.0, 1.0 - float(distance)))
+            hits.append(
+                {
+                    "text": str(text),
+                    "source": str((metadata or {}).get("source", "unknown")),
+                    "semantic_score": score,
+                    "bm25_score": 0.0,
+                }
             )
-        )
-    return candidates
+        return hits
 
+    def _keyword_search(self, query: str, n_results: int) -> list[dict[str, object]]:
+        """Return the best BM25 matches with scores normalized to 0 to 1."""
+        tokens = tokenize(query)
+        if not tokens:
+            return []
 
-def keyword_search(query: str, top_k: int) -> list[_Candidate]:
-    """Return the highest-scoring BM25 chunks for a query.
+        scores = self.bm25.get_scores(tokens)
+        best = float(np.max(scores)) if len(scores) else 0.0
+        if best <= 0:
+            return []
 
-    Chunks with a zero score are omitted. They share no query terms, so
-    they are not keyword matches.
-    """
-    index, chunks = _load_bm25()
-    tokens = tokenize(query)
-    if not tokens:
-        return []
-    scores = index.get_scores(tokens)
-    ranked = sorted(
-        ((float(score), position) for position, score in enumerate(scores) if score > 0),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    candidates: list[_Candidate] = []
-    for rank, (score, position) in enumerate(ranked[:top_k], start=1):
-        chunk = chunks[position]
-        candidates.append(
-            _Candidate(
-                id=str(chunk["id"]),
-                text=str(chunk["text"]),
-                source=str(chunk["source"]),
-                chunk_index=int(chunk["chunk_index"]),
-                bm25_score=score,
-                bm25_rank=rank,
+        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        hits: list[dict[str, object]] = []
+        for position in ranked[:n_results]:
+            raw = float(scores[position])
+            if raw <= 0:
+                continue
+            hits.append(
+                {
+                    "text": self.bm25_texts[position],
+                    "source": self.bm25_sources[position],
+                    "semantic_score": 0.0,
+                    # Normalized against the best hit for this query, so the
+                    # weighted blend compares like with like.
+                    "bm25_score": raw / best,
+                }
             )
+        return hits
+
+    def retrieve(self, query: str, n_results: int = 5) -> dict[str, object]:
+        """Search both indexes, merge the hits, and rank them.
+
+        Chunks found by both methods keep the higher score from each, so
+        agreement between semantic and keyword search pushes a chunk up.
+        Confidence is the cosine similarity of the best merged chunk.
+        """
+        empty: dict[str, object] = {
+            "chunks": [],
+            "sources": [],
+            "confidence": 0.0,
+            "query": query,
+        }
+        if not query or not query.strip():
+            return empty
+
+        try:
+            semantic_hits = self._semantic_search(query, n_results)
+            keyword_hits = self._keyword_search(query, n_results)
+        except Exception as exc:
+            logger.error("Retrieval failed for %r: %s", query, exc)
+            return empty
+
+        # Deduplicate on the chunk text itself, since the same passage can
+        # surface from both indexes.
+        merged: dict[str, dict[str, object]] = {}
+        for hit in semantic_hits + keyword_hits:
+            key = str(hit["text"])
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = dict(hit)
+                continue
+            existing["semantic_score"] = max(
+                float(existing["semantic_score"]), float(hit["semantic_score"])
+            )
+            existing["bm25_score"] = max(
+                float(existing["bm25_score"]), float(hit["bm25_score"])
+            )
+
+        if not merged:
+            return empty
+
+        for hit in merged.values():
+            hit["combined_score"] = (
+                SEMANTIC_WEIGHT * float(hit["semantic_score"])
+                + BM25_WEIGHT * float(hit["bm25_score"])
+            )
+
+        ranked = sorted(
+            merged.values(),
+            key=lambda hit: float(hit["combined_score"]),
+            reverse=True,
+        )[:5]
+
+        chunks = [str(hit["text"]) for hit in ranked]
+        sources = [str(hit["source"]) for hit in ranked]
+        confidence = self.compute_confidence(query, chunks[0])
+
+        logger.info(
+            "Retrieved %d chunk(s) for %r (confidence=%.3f)",
+            len(chunks),
+            query[:60],
+            confidence,
         )
-    return candidates
+        return {
+            "chunks": chunks,
+            "sources": sources,
+            "confidence": confidence,
+            "query": query,
+        }
+
+    def format_context(self, chunks: list[str], sources: list[str]) -> str:
+        """Render retrieved chunks into one labelled block for the LLM.
+
+        Each passage is numbered and tagged with its source file so the
+        model can ground its answer and the log shows where it came from.
+        """
+        if not chunks:
+            return "No relevant information found in the knowledge base."
+
+        sections = []
+        for position, chunk in enumerate(chunks, start=1):
+            source = sources[position - 1] if position <= len(sources) else "unknown"
+            sections.append(f"[{position}] (source: {source})\n{chunk}")
+        return "\n\n".join(sections)
 
 
-def _fusion_score(candidate: _Candidate) -> float:
-    """Score a chunk by reciprocal rank fusion across the two lists."""
-    score = 0.0
-    if candidate.semantic_rank is not None:
-        score += 1.0 / (RRF_K + candidate.semantic_rank)
-    if candidate.bm25_rank is not None:
-        score += 1.0 / (RRF_K + candidate.bm25_rank)
-    return score
+_retriever: HybridRetriever | None = None
 
 
-def _merge_candidates(
-    semantic_hits: list[_Candidate],
-    keyword_hits: list[_Candidate],
-    cosine_by_id: dict[str, float],
-    top_k: int,
-) -> list[RetrievedChunk]:
-    """De-duplicate both hit lists and keep the top fused chunks."""
-    merged: dict[str, _Candidate] = {}
-    for hit in semantic_hits:
-        merged[hit.id] = hit
-    for hit in keyword_hits:
-        existing = merged.get(hit.id)
-        if existing is None:
-            hit.cosine_similarity = cosine_by_id.get(hit.id, 0.0)
-            merged[hit.id] = hit
-            continue
-        existing.bm25_score = hit.bm25_score
-        existing.bm25_rank = hit.bm25_rank
+def get_retriever() -> HybridRetriever:
+    """Return a shared HybridRetriever, building it on first use.
 
-    ranked = sorted(
-        merged.values(),
-        key=lambda hit: (_fusion_score(hit), hit.cosine_similarity),
-        reverse=True,
-    )
-    return [
-        RetrievedChunk(
-            id=hit.id,
-            text=hit.text,
-            source=hit.source,
-            chunk_index=hit.chunk_index,
-            cosine_similarity=hit.cosine_similarity,
-            bm25_score=hit.bm25_score,
-            fusion_score=_fusion_score(hit),
-        )
-        for hit in ranked[:top_k]
-    ]
-
-
-def hybrid_search(query: str, top_k: int = DEFAULT_TOP_K) -> HybridSearchResult:
-    """Search the knowledge base with semantic and keyword retrieval.
-
-    Returns up to ``top_k`` unique chunks. ``confidence`` is the cosine
-    similarity of the highest-ranked chunk after fusion.
+    Loading the embedding model takes a few seconds, so the instance is
+    cached rather than rebuilt for every request.
     """
-    cleaned = query.strip()
-    if not cleaned:
-        raise ValueError("Query must not be empty.")
-    if top_k < 1:
-        raise ValueError("top_k must be at least 1.")
-
-    started = time.perf_counter()
-    query_vector = _embed_query(cleaned)
-    collection = _get_collection()
-    semantic_hits = semantic_search(query_vector, collection, top_k)
-    keyword_hits = keyword_search(cleaned, top_k)
-
-    keyword_only_ids = [
-        hit.id for hit in keyword_hits if all(hit.id != semantic.id for semantic in semantic_hits)
-    ]
-    cosine_for_keyword_only = _cosine_by_id(collection, query_vector, keyword_only_ids)
-    chunks = _merge_candidates(
-        semantic_hits,
-        keyword_hits,
-        cosine_for_keyword_only,
-        top_k,
-    )
-    confidence = chunks[0].cosine_similarity if chunks else 0.0
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info(
-        "Hybrid search returned %d chunk(s) in %.0f ms (confidence=%.3f)",
-        len(chunks),
-        elapsed_ms,
-        confidence,
-    )
-    return HybridSearchResult(chunks=chunks, confidence=confidence)
+    global _retriever
+    if _retriever is None:
+        _retriever = HybridRetriever()
+    return _retriever
 
 
-if __name__ == "__main__":
-    settings.configure_logging()
-    samples = [
-        "What are your Saturday hours?",
-        "How much is the late cancellation fee?",
-        "Do you set broken bones?",
-        "Who won the 1994 world series?",
-    ]
-    for sample in samples:
-        found = hybrid_search(sample)
-        top = found.chunks[0]
-        print(
-            f"\nQ: {sample}\n"
-            f"confidence={found.confidence:.3f} source={top.source} "
-            f"cosine={top.cosine_similarity:.3f} bm25={top.bm25_score:.3f}\n"
-            f"{top.text[:180]}"
-        )
+def reset_retriever() -> None:
+    """Drop the cached retriever so the next call reloads both indexes.
+
+    Called after re-ingestion, which replaces the files underneath it.
+    """
+    global _retriever
+    _retriever = None

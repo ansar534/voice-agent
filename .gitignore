@@ -9,3 +9,4 @@ chroma_db/
 *.egg-info/
 appointments.json
 escalations.json
+bm25_index.pkl

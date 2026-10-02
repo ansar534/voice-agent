@@ -1,8 +1,8 @@
-"""Node functions that make up the agent graph.
+"""Graph node functions.
 
-Every node takes the current AgentState and returns only the fields it
-changed. LLM calls go through call_llm, which logs token counts and
-latency and converts provider failures into readable errors.
+Every node takes the AgentState and returns ONLY the fields it changed.
+Because ``messages`` has an operator.add reducer, a node returns just the
+new messages it produced and LangGraph appends them to the history.
 """
 
 from __future__ import annotations
@@ -13,398 +13,379 @@ import re
 import time
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from groq import Groq
 
-from backend.agent.state import VALID_INTENTS, AgentState, Intent, Message
-from backend.agent.tools import book_appointment, escalate_to_human
-from backend.config import settings
-from backend.retrieval.vectorstore import hybrid_search
+from ..config import (
+    BUSINESS_NAME,
+    CONFIDENCE_THRESHOLD,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    INTENT_TEMPERATURE,
+    MAX_HISTORY_TURNS,
+    MAX_OUTPUT_TOKENS,
+    RESPONSE_TEMPERATURE,
+    SYSTEM_PROMPT,
+    groq_key_is_set,
+)
+from .state import BOOKING_FIELDS, VALID_INTENTS, AgentState
+from .tools import book_appointment, escalate_to_human, search_knowledge_base
 
 logger = logging.getLogger(__name__)
 
-MAX_CLARIFICATION_ATTEMPTS = 1
-BOOKING_FIELDS = ("name", "date", "time", "reason")
+# Stops the unknown -> clarify -> classify loop from running forever.
+MAX_CLARIFY_ATTEMPTS = 1
 
-_llm_cache: dict[float, Any] = {}
+LLM_UNAVAILABLE_MESSAGE = (
+    "I'm having trouble reaching my system right now. "
+    "Let me connect you with our staff."
+)
+
+_client: Groq | None = None
 
 
-class LLMError(RuntimeError):
-    """Raised when the Groq call fails or returns nothing usable."""
+def get_client() -> Groq:
+    """Return a cached Groq client, creating it on first use.
 
-
-def get_llm(temperature: float) -> Any:
-    """Return a cached ChatGroq client for the given temperature.
-
-    Tests replace this function to run the graph without network access.
+    Raises RuntimeError when no key is configured so callers can fall
+    back instead of failing with a confusing auth error.
     """
-    if temperature in _llm_cache:
-        return _llm_cache[temperature]
-    if not settings.groq_api_key or settings.groq_api_key == "your_groq_api_key_here":
-        raise LLMError(
-            "GROQ_API_KEY is not set. Add a real key to .env before chatting."
-        )
-    try:
-        from langchain_groq import ChatGroq
-
-        client = ChatGroq(
-            model=settings.groq_model,
-            temperature=temperature,
-            max_tokens=settings.max_output_tokens,
-            api_key=settings.groq_api_key,
-        )
-    except Exception as exc:
-        raise LLMError(f"Could not create the Groq client: {exc}") from exc
-    _llm_cache[temperature] = client
-    return client
+    global _client
+    if _client is None:
+        if not groq_key_is_set():
+            raise RuntimeError("GROQ_API_KEY is not set in .env")
+        _client = Groq(api_key=GROQ_API_KEY)
+    return _client
 
 
-def call_llm(prompt_messages: list[Any], temperature: float, purpose: str) -> str:
-    """Send messages to Groq and return the reply text.
+def call_llm(messages: list[dict[str, str]], temperature: float, purpose: str) -> str:
+    """Send a chat completion to Groq and return the reply text.
 
-    Logs input tokens, output tokens, and latency in milliseconds for
-    every call. Raises LLMError so callers can degrade gracefully.
+    Logs input tokens, output tokens, and latency for every call.
+    Raises RuntimeError on any failure, which each node catches and turns
+    into a safe fallback rather than a crash.
     """
     started = time.perf_counter()
     try:
-        client = get_llm(temperature)
-        reply = client.invoke(prompt_messages)
-    except LLMError:
-        raise
+        completion = get_client().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=MAX_OUTPUT_TOKENS,
+        )
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.error("LLM call [%s] failed after %.0f ms: %s", purpose, elapsed_ms, exc)
-        raise LLMError(f"The language model call failed: {exc}") from exc
+        raise RuntimeError(f"Groq call failed: {exc}") from exc
 
     elapsed_ms = (time.perf_counter() - started) * 1000
-    usage = getattr(reply, "usage_metadata", None) or {}
+    usage = getattr(completion, "usage", None)
     logger.info(
-        "LLM call [%s] model=%s temp=%.1f input_tokens=%s output_tokens=%s latency_ms=%.0f",
+        "LLM [%s] model=%s temp=%.1f input_tokens=%s output_tokens=%s latency_ms=%.0f",
         purpose,
-        settings.groq_model,
+        GROQ_MODEL,
         temperature,
-        usage.get("input_tokens", "unknown"),
-        usage.get("output_tokens", "unknown"),
+        getattr(usage, "prompt_tokens", "?"),
+        getattr(usage, "completion_tokens", "?"),
         elapsed_ms,
     )
-    text = getattr(reply, "content", "")
-    if isinstance(text, list):
-        text = " ".join(str(part) for part in text)
-    text = str(text).strip()
+
+    text = (completion.choices[0].message.content or "").strip()
     if not text:
-        raise LLMError("The language model returned an empty response.")
+        raise RuntimeError("Groq returned an empty response.")
     return text
 
 
-def _history_messages(state: AgentState) -> list[Any]:
-    """Convert the session's sliding window into LangChain messages."""
-    history: list[Any] = []
-    stored: list[Message] = state.get("messages", []) or []
-    for message in stored[-settings.context_window_messages :]:
-        if message["role"] == "user":
-            history.append(HumanMessage(content=message["content"]))
-        else:
-            history.append(AIMessage(content=message["content"]))
-    return history
+def _last_user_message(state: AgentState) -> str:
+    """Return the most recent user message text, or an empty string."""
+    for message in reversed(state.get("messages", []) or []):
+        if message.get("role") == "user":
+            return str(message.get("content", ""))
+    return ""
 
 
-def _extract_json_object(text: str) -> dict[str, Any]:
-    """Pull the first JSON object out of an LLM reply.
-
-    Models often wrap JSON in prose or code fences, so the braces are
-    located rather than parsing the whole string.
-    """
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+def _recent_history(state: AgentState) -> list[dict[str, str]]:
+    """Return the last MAX_HISTORY_TURNS messages in Groq's format."""
+    history = state.get("messages", []) or []
+    return [
+        {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
+        for m in history[-MAX_HISTORY_TURNS:]
+    ]
 
 
-def _fallback_intent(user_input: str) -> Intent:
-    """Guess an intent from keywords when the LLM is unavailable."""
-    text = user_input.lower()
-    if any(word in text for word in ("human", "agent", "manager", "representative", "person")):
+def _transcript(state: AgentState) -> str:
+    """Flatten recent messages into a plain transcript for summaries."""
+    return "\n".join(
+        f"{m.get('role')}: {m.get('content')}" for m in _recent_history(state)
+    )
+
+
+def _keyword_intent(text: str) -> str:
+    """Guess an intent from obvious keywords when the LLM is unreachable."""
+    lowered = text.lower()
+    if any(word in lowered for word in ("human", "manager", "agent", "emergency", "urgent")):
         return "escalate"
-    if any(word in text for word in ("appointment", "book", "schedule", "reschedule", "slot")):
+    if any(word in lowered for word in ("appointment", "book", "schedule", "reschedule", "cancel")):
         return "book_appointment"
-    if "?" in text or any(word in text for word in ("what", "when", "where", "how", "do you", "are you")):
+    if "?" in lowered or any(
+        word in lowered for word in ("what", "when", "where", "how", "do you", "are you")
+    ):
         return "faq"
     return "unknown"
 
 
-# --------------------------------------------------------------------------
-# Nodes
-# --------------------------------------------------------------------------
-
-
+# ---------------------------------------------------------------------------
+# NODE 1
+# ---------------------------------------------------------------------------
 def classify_intent(state: AgentState) -> dict[str, Any]:
-    """Label the current message as faq, book_appointment, escalate, or unknown."""
-    user_input = state.get("user_input", "")
-    instructions = (
-        "Classify the customer's latest message into exactly one intent.\n"
-        "faq: a question about hours, location, services, policies, insurance, or how things work.\n"
-        "book_appointment: wants to book, change, or cancel an appointment, or asks about open times.\n"
-        "escalate: asks for a human, is angry, has an emergency, or needs something staff must handle.\n"
-        "unknown: greetings, chit-chat, or anything too vague to act on.\n"
-        "Reply with the single intent word and nothing else."
+    """Label the latest user message with one of the four intents."""
+    user_message = _last_user_message(state)
+    system_prompt = (
+        "You are an intent classifier. Given the user message, classify it as exactly "
+        "one of: faq, book_appointment, escalate, unknown.\n"
+        "faq = questions about clinic info, hours, services, policies, insurance\n"
+        "book_appointment = wants to schedule, reschedule, or cancel a visit\n"
+        "escalate = angry, urgent medical need, or explicitly asks for human\n"
+        "unknown = unclear, greeting, or out of scope\n"
+        "Respond with ONLY the intent word, nothing else."
     )
-    prompt = [SystemMessage(content=instructions), *_history_messages(state)]
-    prompt.append(HumanMessage(content=f"Latest message: {user_input}"))
 
     try:
-        raw = call_llm(prompt, settings.intent_temperature, "classify_intent").lower()
-    except LLMError as exc:
-        intent = _fallback_intent(user_input)
-        logger.warning("Intent classification fell back to keywords: %s", exc)
-        return {"intent": intent, "error": str(exc)}
+        raw = call_llm(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            INTENT_TEMPERATURE,
+            "classify_intent",
+        ).lower()
+        intent = next((name for name in VALID_INTENTS if name in raw), "unknown")
+    except RuntimeError as exc:
+        logger.warning("Intent classification falling back to keywords: %s", exc)
+        intent = _keyword_intent(user_message)
 
-    intent: Intent = "unknown"
-    for candidate in VALID_INTENTS:
-        if candidate in raw:
-            intent = candidate
-            break
-    logger.info("Session %s classified as '%s'", state.get("session_id", "?"), intent)
-    return {"intent": intent, "error": ""}
+    logger.info("Session %s intent=%s", state.get("session_id", "?"), intent)
+    return {"intent": intent, "turn_count": int(state.get("turn_count", 0)) + 1}
 
 
+# ---------------------------------------------------------------------------
+# NODE 2
+# ---------------------------------------------------------------------------
 def retrieve_context(state: AgentState) -> dict[str, Any]:
-    """Run hybrid retrieval for the current question and record confidence."""
-    query = state.get("user_input", "")
-    try:
-        result = hybrid_search(query, top_k=settings.retrieval_top_k)
-        chunks = [
-            {
-                "source": chunk.source,
-                "text": chunk.text,
-                "similarity": round(chunk.cosine_similarity, 4),
-            }
-            for chunk in result.chunks
-        ]
-        confidence = result.confidence
-    except Exception as exc:
-        logger.error("Retrieval failed for %r: %s", query, exc)
-        return {
-            "retrieved_context": [],
-            "confidence": 0.0,
-            "needs_escalation": True,
-            "action_taken": "retrieval_failed",
-            "error": f"Knowledge base lookup failed: {exc}",
-        }
+    """Fetch supporting passages and score how well they match the question.
 
-    needs_escalation = confidence < settings.escalation_confidence_threshold
-    return {
-        "retrieved_context": chunks,
+    When confidence falls under CONFIDENCE_THRESHOLD the intent is flipped
+    to "escalate", so a weak match never reaches the answer generator.
+    """
+    query = _last_user_message(state)
+    result = search_knowledge_base(query)
+    confidence = float(result["confidence"])
+
+    update: dict[str, Any] = {
+        "retrieved_context": result["context"],
         "confidence": confidence,
-        "needs_escalation": needs_escalation,
-        "action_taken": "search_knowledge_base",
+    }
+    if confidence < CONFIDENCE_THRESHOLD:
+        logger.info(
+            "Confidence %.3f below %.2f, routing to escalation",
+            confidence,
+            CONFIDENCE_THRESHOLD,
+        )
+        update["intent"] = "escalate"
+        update["needs_escalation"] = True
+    return update
+
+
+# ---------------------------------------------------------------------------
+# NODE 3
+# ---------------------------------------------------------------------------
+def generate_response(state: AgentState) -> dict[str, Any]:
+    """Answer the question strictly from the retrieved context."""
+    context = state.get("retrieved_context", "") or "No context available."
+    prompt: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": f"{SYSTEM_PROMPT}\n\nContext from the knowledge base:\n{context}",
+        }
+    ]
+    prompt.extend(_recent_history(state))
+
+    try:
+        answer = call_llm(prompt, RESPONSE_TEMPERATURE, "generate_response")
+        action = "faq_response"
+    except RuntimeError as exc:
+        logger.error("Response generation failed: %s", exc)
+        answer = LLM_UNAVAILABLE_MESSAGE
+        action = "llm_unavailable"
+
+    return {
+        "messages": [{"role": "assistant", "content": answer}],
+        "action_taken": action,
     }
 
 
-def generate_response(state: AgentState) -> dict[str, Any]:
-    """Answer the question using only the retrieved passages."""
-    chunks = state.get("retrieved_context", []) or []
-    context_text = "\n\n".join(
-        f"(source: {chunk['source']})\n{chunk['text']}" for chunk in chunks
-    )
-    instructions = (
-        f"{settings.system_prompt}\n\n"
-        "Answer using ONLY the knowledge base passages below. "
-        "Never invent details that are not in them. If the passages do not "
-        "cover the question, say plainly that you do not have that information "
-        "and offer to have a staff member follow up. "
-        "Keep the answer to two or three sentences, the way you would say it on a call.\n\n"
-        f"Knowledge base passages:\n{context_text}"
-    )
-    prompt = [SystemMessage(content=instructions), *_history_messages(state)]
-    prompt.append(HumanMessage(content=state.get("user_input", "")))
-
-    try:
-        answer = call_llm(prompt, settings.response_temperature, "generate_response")
-    except LLMError as exc:
-        return {
-            "response": (
-                "I am having trouble reaching my system right now. "
-                "Let me have a staff member follow up with you."
-            ),
-            "needs_escalation": True,
-            "action_taken": "llm_unavailable",
-            "error": str(exc),
-        }
-    return {"response": answer, "action_taken": "answered_from_knowledge_base"}
-
-
+# ---------------------------------------------------------------------------
+# NODE 4
+# ---------------------------------------------------------------------------
 def collect_booking_info(state: AgentState) -> dict[str, Any]:
-    """Pull name, date, time, and reason out of the conversation.
+    """Pull booking details out of the conversation and ask for what is missing.
 
-    Missing fields produce a clarifying question instead of a booking.
+    Extraction is deliberately conservative: the model is told to leave a
+    field blank rather than guess, so the agent never invents a date.
     """
-    known: dict[str, Any] = dict(state.get("booking_info", {}) or {})
-    transcript = "\n".join(
-        f"{message['role']}: {message['content']}"
-        for message in (state.get("messages", []) or [])[-settings.context_window_messages :]
-    )
-    instructions = (
-        "Extract appointment details from the conversation. "
-        'Reply with JSON only, using exactly these keys: {"name": "", "date": "", '
-        '"time": "", "reason": ""}. '
-        "Use an empty string for anything the customer has not stated. "
-        "Dates must be YYYY-MM-DD. Never guess a date or a time."
-    )
-    prompt = [
-        SystemMessage(content=instructions),
-        HumanMessage(content=f"Conversation:\n{transcript}\n\nLatest: {state.get('user_input', '')}"),
+    booking: dict[str, str] = dict(state.get("booking_info", {}) or {})
+    extraction_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Extract appointment details from the conversation. Reply with JSON "
+                'only, using exactly these keys: {"name": "", "date": "", "time": "", '
+                '"reason": ""}. Use an empty string for anything the customer has not '
+                "stated. Never guess a date, a time, or a name."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Conversation:\n{_transcript(state)}",
+        },
     ]
 
     try:
-        raw = call_llm(prompt, settings.intent_temperature, "collect_booking_info")
-        extracted = _extract_json_object(raw)
-    except LLMError as exc:
+        raw = call_llm(extraction_prompt, INTENT_TEMPERATURE, "collect_booking_info")
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        extracted = json.loads(match.group(0)) if match else {}
+    except (RuntimeError, json.JSONDecodeError) as exc:
         logger.warning("Booking extraction failed: %s", exc)
         extracted = {}
 
     for field in BOOKING_FIELDS:
         value = str(extracted.get(field, "")).strip()
         if value:
-            known[field] = value
+            booking[field] = value
 
-    missing = [field for field in BOOKING_FIELDS if not known.get(field)]
-    if missing:
-        readable = {
-            "name": "your full name",
-            "date": "the date you would like",
-            "time": "the time that works for you",
-            "reason": "the reason for the visit",
-        }
-        labels = [readable[field] for field in missing]
-        if len(labels) == 1:
-            wanted = labels[0]
-        else:
-            wanted = f"{', '.join(labels[:-1])}, and {labels[-1]}"
-        return {
-            "booking_info": known,
-            "response": f"Happy to get that booked. Could you give me {wanted}?",
-            "action_taken": "requested_missing_booking_info",
-        }
-    return {"booking_info": known, "action_taken": "collected_booking_info"}
+    missing = [field for field in BOOKING_FIELDS if not booking.get(field)]
+    if not missing:
+        return {"booking_info": booking, "action_taken": "booking_info_complete"}
+
+    questions = {
+        "name": "Of course. Can I get your full name?",
+        "date": "What date would you like to come in?",
+        "time": "What time works best for you?",
+        "reason": "And what's the reason for your visit?",
+    }
+    return {
+        "messages": [{"role": "assistant", "content": questions[missing[0]]}],
+        "booking_info": booking,
+        "action_taken": "collecting_booking_info",
+    }
 
 
-def book_appointment_node(state: AgentState) -> dict[str, Any]:
-    """Call the booking tool and return the confirmation to the caller."""
+# ---------------------------------------------------------------------------
+# NODE 5
+# ---------------------------------------------------------------------------
+def process_booking(state: AgentState) -> dict[str, Any]:
+    """Save the appointment and confirm it to the caller."""
     booking = state.get("booking_info", {}) or {}
-    try:
-        confirmation = book_appointment.invoke(
-            {
-                "name": booking.get("name", ""),
-                "date": booking.get("date", ""),
-                "time": booking.get("time", ""),
-                "reason": booking.get("reason", ""),
-            }
-        )
-    except Exception as exc:
-        logger.error("Booking tool failed: %s", exc)
-        return {
-            "response": "I could not save that appointment. Let me get a staff member to help.",
-            "needs_escalation": True,
-            "action_taken": "book_appointment_failed",
-            "error": str(exc),
-        }
-    return {"response": confirmation, "action_taken": "book_appointment"}
+    confirmation = book_appointment(
+        name=booking.get("name", ""),
+        date=booking.get("date", ""),
+        time=booking.get("time", ""),
+        reason=booking.get("reason", ""),
+    )
+    return {
+        "messages": [{"role": "assistant", "content": confirmation}],
+        "action_taken": "appointment_booked",
+        # Clear the slate so the next request starts fresh.
+        "booking_info": {},
+    }
 
 
-def escalate(state: AgentState) -> dict[str, Any]:
-    """Log the handoff and tell the caller a person will follow up."""
-    confidence = state.get("confidence", 0.0)
-    if state.get("intent") == "escalate":
-        reason = "Caller asked for a human or raised something staff must handle."
-    elif confidence < settings.escalation_confidence_threshold:
-        reason = f"Retrieval confidence {confidence:.2f} below threshold."
+# ---------------------------------------------------------------------------
+# NODE 6
+# ---------------------------------------------------------------------------
+def handle_escalation(state: AgentState) -> dict[str, Any]:
+    """Summarize the conversation, log the handoff, and tell the caller."""
+    confidence = float(state.get("confidence", 0.0))
+    if confidence and confidence < CONFIDENCE_THRESHOLD:
+        reason = f"Retrieval confidence {confidence:.2f} below {CONFIDENCE_THRESHOLD}."
     else:
-        reason = "Agent could not complete the request."
+        reason = "Caller asked for a person or raised something staff must handle."
 
-    summary = " | ".join(
-        f"{message['role']}: {message['content']}"
-        for message in (state.get("messages", []) or [])[-settings.context_window_messages :]
-    )
+    summary_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Summarize this customer service conversation in exactly two sentences "
+                "for the staff member taking over. State what the customer wants and "
+                "anything still unresolved."
+            ),
+        },
+        {"role": "user", "content": _transcript(state)},
+    ]
     try:
-        handoff = escalate_to_human.invoke({"reason": reason, "summary": summary})
-    except Exception as exc:
-        logger.error("Escalation tool failed: %s", exc)
-        handoff = "Let me pass this to one of our staff members, who will follow up shortly."
+        summary = call_llm(summary_prompt, INTENT_TEMPERATURE, "escalation_summary")
+    except RuntimeError as exc:
+        logger.warning("Summary generation failed, using raw transcript: %s", exc)
+        summary = _transcript(state)[:500]
+
+    handoff = escalate_to_human(reason=reason, conversation_summary=summary)
     return {
-        "response": handoff,
+        "messages": [{"role": "assistant", "content": handoff}],
         "needs_escalation": True,
-        "action_taken": "escalate_to_human",
+        "action_taken": "escalated",
     }
 
 
-def clarify(state: AgentState) -> dict[str, Any]:
-    """Ask one short question to find out what the caller needs."""
-    attempts = int(state.get("clarification_attempts", 0)) + 1
-    instructions = (
-        f"{settings.system_prompt}\n\n"
-        "You could not tell what the customer needs. Reply with one short, friendly "
-        "question that finds out whether they want information or an appointment. "
-        "Do not answer anything else."
-    )
-    prompt = [SystemMessage(content=instructions), *_history_messages(state)]
-    prompt.append(HumanMessage(content=state.get("user_input", "")))
+# ---------------------------------------------------------------------------
+# NODE 7
+# ---------------------------------------------------------------------------
+def handle_unknown(state: AgentState) -> dict[str, Any]:
+    """Ask the caller to say more about what they need.
 
-    try:
-        question = call_llm(prompt, settings.response_temperature, "clarify")
-    except LLMError as exc:
-        logger.warning("Clarification fell back to a fixed prompt: %s", exc)
-        question = (
-            "Happy to help. Are you looking for information about the clinic, "
-            "or would you like to book an appointment?"
-        )
-    return {
-        "response": question,
-        "clarification_attempts": attempts,
-        "action_taken": "clarify",
+    The graph loops back to classify_intent after this, which gives a
+    transient misclassification one chance to resolve. The question is
+    only added on the first pass so the retry cannot repeat it.
+    """
+    attempts = int(state.get("clarify_attempts", 0))
+    update: dict[str, Any] = {
+        "action_taken": "clarified",
+        "clarify_attempts": attempts + 1,
     }
+    if attempts == 0:
+        update["messages"] = [
+            {
+                "role": "assistant",
+                "content": (
+                    f"I can help with {BUSINESS_NAME} information or booking an "
+                    "appointment. Could you tell me more about what you need?"
+                ),
+            }
+        ]
+    return update
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Routing
-# --------------------------------------------------------------------------
-
-
-def route_after_intent(state: AgentState) -> str:
-    """Send the turn down the branch matching the classified intent."""
+# ---------------------------------------------------------------------------
+def route_by_intent(state: AgentState) -> str:
+    """Pick the branch matching the classified intent."""
     intent = state.get("intent", "unknown")
-    if intent in ("faq", "book_appointment", "escalate"):
-        return intent
-    if int(state.get("clarification_attempts", 0)) >= MAX_CLARIFICATION_ATTEMPTS:
-        # The caller was already asked once, so stop looping and hand off.
-        return "escalate"
-    return "unknown"
-
-
-def route_after_retrieval(state: AgentState) -> str:
-    """Escalate weak retrieval instead of letting the model guess."""
-    if state.get("needs_escalation"):
-        logger.info(
-            "Confidence %.2f below %.2f, escalating",
-            state.get("confidence", 0.0),
-            settings.escalation_confidence_threshold,
-        )
-        return "escalate"
-    return "generate_response"
+    return intent if intent in VALID_INTENTS else "unknown"
 
 
 def route_after_booking_info(state: AgentState) -> str:
-    """Book only once every required detail is known."""
-    booking = state.get("booking_info", {}) or {}
-    if all(booking.get(field) for field in BOOKING_FIELDS):
-        return "book_appointment"
-    return "end"
+    """Book once every detail is known, otherwise return the question."""
+    if state.get("action_taken") == "booking_info_complete":
+        return "booking_info_complete"
+    return "incomplete"
 
 
-def route_after_clarify(state: AgentState) -> str:
-    """Re-classify once after clarifying, then stop to wait for the caller."""
-    if int(state.get("clarification_attempts", 0)) < MAX_CLARIFICATION_ATTEMPTS:
-        return "classify_intent"
-    return "end"
+def route_after_unknown(state: AgentState) -> str:
+    """Retry classification once, then stop and wait for the caller.
+
+    The spec loops handle_unknown straight back to classify_intent. With
+    no new user input that would re-classify the same text as unknown
+    forever, so the retry is capped.
+    """
+    if int(state.get("clarify_attempts", 0)) <= MAX_CLARIFY_ATTEMPTS:
+        return "retry"
+    return "done"

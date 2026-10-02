@@ -1,197 +1,172 @@
-"""FastAPI application exposing the agent to the dashboard.
+"""FastAPI service exposing the agent to the Streamlit dashboard.
 
-Run with: uvicorn backend.main:app --reload
+Start with:
+    python -m uvicorn backend.main:app --reload
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
-from datetime import date
-from typing import Any
+import time
+import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.agent.graph import get_compiled_graph, run_agent
-from backend.agent.tools import load_appointments, load_escalations
-from backend.config import settings
-from backend.memory.session import Session, session_store
-from backend.models.schemas import (
+from .agent.graph import run_agent
+from .agent.tools import get_appointments, get_escalations
+from .config import BUSINESS_NAME, GROQ_MODEL, configure_logging, groq_key_is_set
+from .memory.session import session_memory
+from .models.schemas import (
     AnalyticsResponse,
     Appointment,
     ChatRequest,
     ChatResponse,
     Escalation,
+    HealthResponse,
     HistoryResponse,
     IngestResponse,
-    MessageModel,
 )
-from backend.retrieval.ingest import ingest
+from .retrieval.ingest import run_ingestion
+from .retrieval.vectorstore import reset_retriever
 
-settings.configure_logging()
+configure_logging()
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Compile the agent graph at startup so the first chat is not slow."""
-    get_compiled_graph()
-    logger.info("API ready for %s", settings.business_name)
-    yield
-
-
 app = FastAPI(
-    title=f"{settings.business_name} Voice Agent",
-    description="Chat agent with hybrid retrieval, booking, and escalation.",
+    title=f"{BUSINESS_NAME} Voice Agent",
+    description="Chat agent with hybrid retrieval, appointment booking, and escalation.",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    """Report that the API is up and whether a Groq key is configured."""
-    key_set = bool(settings.groq_api_key) and settings.groq_api_key != "your_groq_api_key_here"
-    return {
-        "status": "ok",
-        "business_name": settings.business_name,
-        "model": settings.groq_model,
-        "groq_api_key_configured": key_set,
-    }
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log the method, path, status, and duration of every request."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "%s %s -> %d (%.0f ms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Report service status and whether a Groq key is configured."""
+    return HealthResponse(
+        status="ok",
+        business=BUSINESS_NAME,
+        model=GROQ_MODEL,
+        groq_key_configured=groq_key_is_set(),
+    )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    """Handle one caller message and return the agent's reply."""
-    session = session_store.add_user_message(request.session_id, request.message)
-    window = session_store.context_window(request.session_id)
+    """Handle one caller message and return the agent's reply.
 
-    state = await run_agent(
-        session_id=request.session_id,
-        user_input=request.message,
-        messages=window,
-        booking_info=session.booking_info,
-    )
-
-    response_text = state.get("response", "")
-    intent = state.get("intent", "unknown")
-    confidence = float(state.get("confidence", 0.0))
-    action_taken = state.get("action_taken", "none")
-    booking_info = state.get("booking_info", {}) or {}
-
-    if action_taken == "book_appointment":
-        # The visit is booked, so the next request starts from scratch.
-        booking_info = {}
-        session.booking_info.clear()
-
-    session_store.add_agent_turn(
-        session_id=request.session_id,
-        response=response_text,
-        intent=intent,
-        action_taken=action_taken,
-        confidence=confidence,
-        booking_info=booking_info,
-    )
+    An empty session_id starts a new conversation with a fresh UUID.
+    The agent runs in a worker thread because the graph is synchronous.
+    """
+    session_id = request.session_id.strip() or str(uuid.uuid4())
+    try:
+        result = await asyncio.to_thread(run_agent, session_id, request.message)
+    except Exception as exc:
+        logger.exception("Chat failed for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
 
     return ChatResponse(
-        response=response_text,
-        intent=intent,
-        confidence=max(0.0, min(1.0, confidence)),
-        action_taken=action_taken,
-        needs_escalation=bool(state.get("needs_escalation", False)),
-        session_id=request.session_id,
+        response=result["response"],
+        intent=result["intent"],
+        confidence=max(0.0, min(1.0, float(result["confidence"]))),
+        action_taken=result["action_taken"],
+        session_id=result["session_id"],
+        needs_escalation=bool(result.get("needs_escalation", False)),
     )
 
 
 @app.get("/sessions/{session_id}/history", response_model=HistoryResponse)
-async def get_history(session_id: str) -> HistoryResponse:
-    """Return the full stored conversation for one session."""
-    session: Session | None = session_store.get(session_id)
-    if session is None:
+async def get_session_history(session_id: str) -> HistoryResponse:
+    """Return the full message history and metadata for one session."""
+    if session_id not in session_memory.sessions:
         raise HTTPException(status_code=404, detail=f"Unknown session '{session_id}'.")
+
+    session = session_memory.get_session(session_id)
     return HistoryResponse(
-        session_id=session.session_id,
-        messages=[MessageModel(role=m["role"], content=m["content"]) for m in session.messages],
-        intent_history=session.intent_history,
-        actions_taken=session.actions_taken,
-        summary=session.summary,
-        started_at=session.started_at,
-        last_active_at=session.last_active_at,
-        turns=session.turns,
+        session_id=session_id,
+        messages=session_memory.get_full_history(session_id),
+        intent_history=session["intent_history"],
+        actions_taken=session["actions_taken"],
+        turn_count=session["turn_count"],
+        start_time=session["start_time"],
+        last_active=session["last_active"],
     )
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str) -> dict[str, str]:
+    """Forget one conversation."""
+    if not session_memory.clear_session(session_id):
+        raise HTTPException(status_code=404, detail=f"Unknown session '{session_id}'.")
+    return {"status": "cleared", "session_id": session_id}
 
 
 @app.get("/appointments", response_model=list[Appointment])
-async def get_appointments() -> list[Appointment]:
-    """List every appointment booked through the agent, newest first."""
-    records = await asyncio.to_thread(load_appointments)
+async def list_appointments() -> list[Appointment]:
+    """Return every booked appointment, newest first."""
+    records = await asyncio.to_thread(get_appointments)
     return [Appointment(**record) for record in reversed(records)]
 
 
+@app.get("/escalations", response_model=list[Escalation])
+async def list_escalations() -> list[Escalation]:
+    """Return every logged handoff to a human, newest first."""
+    records = await asyncio.to_thread(get_escalations)
+    return [Escalation(**record) for record in reversed(records)]
+
+
 @app.get("/analytics", response_model=AnalyticsResponse)
-async def get_analytics() -> AnalyticsResponse:
-    """Aggregate session, booking, and escalation stats for the dashboard."""
-    sessions = session_store.all_sessions()
-    appointments = await asyncio.to_thread(load_appointments)
-    escalations = await asyncio.to_thread(load_escalations)
-    today = date.today().isoformat()
-
-    intent_breakdown: dict[str, int] = {}
-    confidences: list[float] = []
-    total_messages = 0
-    for session in sessions:
-        total_messages += len(session.messages)
-        confidences.extend(session.confidences)
-        for intent in session.intent_history:
-            intent_breakdown[intent] = intent_breakdown.get(intent, 0) + 1
-
-    conversations_today = sum(
-        1 for session in sessions if session.started_at.date().isoformat() == today
-    )
-    escalation_turns = sum(
-        1
-        for session in sessions
-        for action in session.actions_taken
-        if action == "escalate_to_human"
-    )
-    total_turns = sum(len(session.intent_history) for session in sessions)
-
+async def analytics() -> AnalyticsResponse:
+    """Return aggregate session stats plus booking and escalation counts."""
+    stats = session_memory.get_analytics()
+    appointments = await asyncio.to_thread(get_appointments)
+    escalations = await asyncio.to_thread(get_escalations)
     return AnalyticsResponse(
-        total_conversations=len(sessions),
-        conversations_today=conversations_today,
-        total_messages=total_messages,
-        intent_breakdown=intent_breakdown,
-        average_confidence=(sum(confidences) / len(confidences)) if confidences else 0.0,
+        **stats,
         total_appointments=len(appointments),
-        appointments_today=sum(1 for a in appointments if a.get("date") == today),
         total_escalations=len(escalations),
-        escalation_rate=(escalation_turns / total_turns) if total_turns else 0.0,
-        recent_appointments=[Appointment(**record) for record in list(reversed(appointments))[:10]],
-        recent_escalations=[Escalation(**record) for record in list(reversed(escalations))[:10]],
     )
 
 
 @app.post("/ingest", response_model=IngestResponse)
-async def trigger_ingest() -> IngestResponse:
-    """Re-index the knowledge base from data/knowledge_base/."""
+async def ingest() -> IngestResponse:
+    """Rebuild the knowledge base indexes from data/knowledge_base/."""
     try:
-        summary = await asyncio.to_thread(ingest)
+        summary = await asyncio.to_thread(run_ingestion)
     except Exception as exc:
         logger.exception("Ingestion failed")
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
+
+    # The retriever holds the old collection and index in memory.
+    reset_retriever()
     return IngestResponse(
+        status="success",
         documents=int(summary["documents"]),
-        chunks=int(summary["chunks"]),
+        chunks_stored=int(summary["chunks_stored"]),
         embedding_model=str(summary["embedding_model"]),
-        chroma_persist_dir=str(summary["chroma_persist_dir"]),
-        bm25_index_path=str(summary["bm25_index_path"]),
     )

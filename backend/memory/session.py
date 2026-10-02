@@ -1,185 +1,154 @@
-"""In-memory conversation store, one record per session id.
+"""In-memory conversation store, one entry per session id.
 
-Only the last few messages are sent to the LLM. Once a conversation runs
-long, the older half is compressed into a summary so context stays small
-without losing what was already discussed.
+Phase 1 keeps everything in a process dictionary: restarting the API
+clears all sessions. Appointments and escalations survive because the
+tools write them to disk.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from backend.agent.state import Message
-from backend.config import settings
+from ..config import MAX_HISTORY_TURNS
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Session:
-    """Everything remembered about one conversation."""
-
-    session_id: str
-    messages: list[Message] = field(default_factory=list)
-    intent_history: list[str] = field(default_factory=list)
-    actions_taken: list[str] = field(default_factory=list)
-    confidences: list[float] = field(default_factory=list)
-    booking_info: dict[str, Any] = field(default_factory=dict)
-    summary: str = ""
-    started_at: datetime = field(default_factory=datetime.now)
-    last_active_at: datetime = field(default_factory=datetime.now)
-
-    @property
-    def turns(self) -> int:
-        """Number of user messages in this conversation."""
-        return sum(1 for message in self.messages if message["role"] == "user")
-
-    @property
-    def average_confidence(self) -> float:
-        """Mean retrieval confidence across turns that searched the knowledge base."""
-        if not self.confidences:
-            return 0.0
-        return sum(self.confidences) / len(self.confidences)
-
-
-def _summarize(messages: list[Message], previous_summary: str) -> str:
-    """Compress older messages into a short plain-text summary.
-
-    Uses the LLM when it is reachable and falls back to a truncated
-    transcript so a provider outage cannot break the conversation.
-    """
-    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-    try:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        from backend.agent.nodes import call_llm
-
-        prompt = [
-            SystemMessage(
-                content=(
-                    "Summarize this customer service conversation in at most four "
-                    "sentences. Keep names, dates, times, booking IDs, and anything "
-                    "still unresolved. Write plain sentences, no bullet points."
-                )
-            ),
-            HumanMessage(
-                content=(
-                    f"Earlier summary: {previous_summary or 'none'}\n\n"
-                    f"Conversation:\n{transcript}"
-                )
-            ),
-        ]
-        return call_llm(prompt, settings.intent_temperature, "summarize_session")
-    except Exception as exc:
-        logger.warning("Falling back to a truncated summary: %s", exc)
-        combined = f"{previous_summary} {transcript}".strip()
-        return combined[-1000:]
-
-
-class SessionStore:
-    """Thread-safe dictionary of sessions keyed by session id."""
+class SessionMemory:
+    """Thread-safe store of per-session conversation history and stats."""
 
     def __init__(self) -> None:
-        self._sessions: dict[str, Session] = {}
+        """Create an empty store."""
+        self.sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def get_or_create(self, session_id: str) -> Session:
-        """Return the session for this id, creating it on first contact."""
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        """Return a session, creating it on first contact."""
         with self._lock:
-            session = self._sessions.get(session_id)
+            session = self.sessions.get(session_id)
             if session is None:
-                session = Session(session_id=session_id)
-                self._sessions[session_id] = session
+                session = {
+                    "session_id": session_id,
+                    "messages": [],
+                    "intent_history": [],
+                    "actions_taken": [],
+                    "confidences": [],
+                    "booking_info": {},
+                    "start_time": datetime.now(),
+                    "last_active": datetime.now(),
+                    "turn_count": 0,
+                }
+                self.sessions[session_id] = session
                 logger.info("Started session %s", session_id)
             return session
 
-    def get(self, session_id: str) -> Session | None:
-        """Return an existing session, or None when the id is unknown."""
-        with self._lock:
-            return self._sessions.get(session_id)
+    def get_history(self, session_id: str) -> list[dict[str, str]]:
+        """Return the last MAX_HISTORY_TURNS messages for a session.
 
-    def all_sessions(self) -> list[Session]:
-        """Return every session, newest activity first."""
+        This sliding window is what gets replayed to the LLM, which keeps
+        prompts small on long conversations.
+        """
+        session = self.get_session(session_id)
         with self._lock:
-            return sorted(
-                self._sessions.values(),
-                key=lambda session: session.last_active_at,
-                reverse=True,
-            )
+            return list(session["messages"][-MAX_HISTORY_TURNS:])
 
-    def add_user_message(self, session_id: str, content: str) -> Session:
-        """Record what the caller said and return the updated session."""
-        session = self.get_or_create(session_id)
+    def get_full_history(self, session_id: str) -> list[dict[str, str]]:
+        """Return every message in a session, for the history endpoint."""
+        session = self.get_session(session_id)
         with self._lock:
-            session.messages.append(Message(role="user", content=content))
-            session.last_active_at = datetime.now()
-        return session
+            return list(session["messages"])
 
-    def add_agent_turn(
+    def save_turn(
         self,
         session_id: str,
-        response: str,
+        user_message: str,
+        assistant_message: str,
         intent: str,
-        action_taken: str,
-        confidence: float,
+        action: str,
+        confidence: float = 0.0,
         booking_info: dict[str, Any] | None = None,
-    ) -> Session:
-        """Record the agent's reply and the metadata the dashboard shows."""
-        session = self.get_or_create(session_id)
+    ) -> None:
+        """Record one complete exchange and its metadata."""
+        session = self.get_session(session_id)
         with self._lock:
-            session.messages.append(Message(role="assistant", content=response))
-            session.intent_history.append(intent)
-            session.actions_taken.append(action_taken)
-            if action_taken == "search_knowledge_base" or confidence > 0:
-                session.confidences.append(confidence)
-            if booking_info:
-                session.booking_info.update(booking_info)
-            session.last_active_at = datetime.now()
-        self._maybe_compress(session)
-        return session
+            session["messages"].append({"role": "user", "content": user_message})
+            session["messages"].append({"role": "assistant", "content": assistant_message})
+            session["intent_history"].append(intent)
+            session["actions_taken"].append(action)
+            if confidence > 0:
+                session["confidences"].append(confidence)
+            # Replace rather than merge: an empty dict after booking is a
+            # deliberate reset of the collected details.
+            session["booking_info"] = dict(booking_info or {})
+            session["turn_count"] += 1
+            session["last_active"] = datetime.now()
 
-    def context_window(self, session_id: str) -> list[Message]:
-        """Return the last few messages, prefixed by the summary when one exists."""
-        session = self.get_or_create(session_id)
+    def save_history(
+        self,
+        session_id: str,
+        messages: list[dict[str, str]],
+        intent: str,
+        action: str,
+    ) -> None:
+        """Overwrite a session's messages and append its latest metadata.
+
+        Kept for callers that manage the message list themselves.
+        """
+        session = self.get_session(session_id)
         with self._lock:
-            window = list(session.messages[-settings.context_window_messages :])
-            summary = session.summary
-        if summary:
-            window.insert(
-                0,
-                Message(role="assistant", content=f"[Earlier conversation summary] {summary}"),
-            )
-        return window
+            session["messages"] = list(messages)
+            session["intent_history"].append(intent)
+            session["actions_taken"].append(action)
+            session["turn_count"] += 1
+            session["last_active"] = datetime.now()
 
-    def _maybe_compress(self, session: Session) -> None:
-        """Summarize and drop older messages once the session runs long."""
+    def get_analytics(self) -> dict[str, Any]:
+        """Aggregate stats across every session for the dashboard."""
         with self._lock:
-            long_enough = session.turns > settings.summarize_after_turns
-            keep = settings.context_window_messages
-            older = session.messages[:-keep] if long_enough else []
-            recent = session.messages[-keep:] if long_enough else []
-            previous_summary = session.summary
-        if not older:
-            return
+            sessions = list(self.sessions.values())
 
-        summary = _summarize(older, previous_summary)
+        intent_counts: dict[str, int] = {}
+        action_counts: dict[str, int] = {}
+        confidences: list[float] = []
+        total_turns = 0
+        escalated_sessions = 0
+
+        for session in sessions:
+            total_turns += session["turn_count"]
+            confidences.extend(session["confidences"])
+            for intent in session["intent_history"]:
+                intent_counts[intent] = intent_counts.get(intent, 0) + 1
+            for action in session["actions_taken"]:
+                action_counts[action] = action_counts.get(action, 0) + 1
+            if "escalated" in session["actions_taken"]:
+                escalated_sessions += 1
+
+        session_count = len(sessions)
+        top_intent = max(intent_counts, key=intent_counts.get) if intent_counts else "n/a"
+
+        return {
+            "total_sessions": session_count,
+            "intent_counts": intent_counts,
+            "action_counts": action_counts,
+            "top_intent": top_intent,
+            "avg_turns": round(total_turns / session_count, 2) if session_count else 0.0,
+            "escalation_rate": round(escalated_sessions / session_count, 3) if session_count else 0.0,
+            "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else 0.0,
+            "total_messages": sum(len(session["messages"]) for session in sessions),
+        }
+
+    def clear_session(self, session_id: str) -> bool:
+        """Delete one session. Returns False when the id is unknown."""
         with self._lock:
-            session.summary = summary
-            session.messages = recent
-        logger.info(
-            "Compressed %d older message(s) for session %s",
-            len(older),
-            session.session_id,
-        )
+            return self.sessions.pop(session_id, None) is not None
 
-    def reset(self) -> None:
-        """Drop every session. Used by tests."""
+    def clear_all(self) -> None:
+        """Delete every session. Used by tests."""
         with self._lock:
-            self._sessions.clear()
+            self.sessions.clear()
 
 
-session_store = SessionStore()
+session_memory = SessionMemory()

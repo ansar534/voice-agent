@@ -1,180 +1,182 @@
-"""Load knowledge-base documents, chunk them, and index them for hybrid search.
+"""Knowledge base ingestion: text files -> chunks -> ChromaDB + BM25.
 
-Text and PDF files under data/knowledge_base/ are split into overlapping
-chunks, embedded locally with all-MiniLM-L6-v2, stored in ChromaDB, and
-written to a BM25 keyword index beside the vector store.
+Run it directly to rebuild both indexes from scratch:
+    python -m backend.retrieval.ingest
 """
 
 from __future__ import annotations
 
-import logging
 import pickle
 import re
-import time
 from pathlib import Path
 
 import chromadb
-from chromadb.errors import NotFoundError
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-from backend.config import settings
+from ..config import (
+    BM25_INDEX_PATH,
+    CHROMA_PERSIST_DIR,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    KNOWLEDGE_BASE_DIR,
+)
 
-logger = logging.getLogger(__name__)
-
-TEXT_EXTENSIONS = {".txt", ".md"}
-PDF_EXTENSIONS = {".pdf"}
 _TOKEN_PATTERN = re.compile(r"\b\w+\b", re.UNICODE)
 
 
 def tokenize(text: str) -> list[str]:
-    """Lowercase a string and return its word tokens for BM25."""
+    """Lowercase text and split it into word tokens for BM25 scoring."""
     return _TOKEN_PATTERN.findall(text.lower())
 
 
-def load_text_file(path: Path) -> str:
-    """Read a UTF-8 text file. Undecodable bytes are replaced, not dropped."""
-    return path.read_text(encoding="utf-8", errors="replace")
+def _split_oversized(piece: str, chunk_size: int, overlap: int) -> list[str]:
+    """Hard-split a single block that is longer than one chunk.
+
+    Used only when a paragraph cannot fit, so the sliding window is a
+    last resort rather than the normal path.
+    """
+    pieces: list[str] = []
+    start = 0
+    while start < len(piece):
+        end = start + chunk_size
+        window = piece[start:end].strip()
+        if window:
+            pieces.append(window)
+        if end >= len(piece):
+            break
+        start = end - overlap
+    return pieces
 
 
-def load_pdf_file(path: Path) -> str:
-    """Extract text from every page of a PDF and join the pages with newlines."""
-    reader = PdfReader(str(path))
-    pages: list[str] = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return "\n".join(pages)
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Split text into overlapping chunks of at most ``chunk_size`` characters.
+
+    Paragraphs are packed together up to the size limit rather than the
+    text being sliced at blind character offsets. Cutting mid-sentence
+    measurably hurts retrieval: it strips the subject from the sentence
+    that answers the question. Consecutive chunks share the tail of the
+    previous one so a fact near a boundary is still findable.
+    """
+    if chunk_size <= overlap:
+        raise ValueError("chunk_size must be larger than overlap.")
+
+    paragraphs = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > chunk_size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_split_oversized(paragraph, chunk_size, overlap))
+            continue
+
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) <= chunk_size:
+            current = candidate
+            continue
+
+        chunks.append(current)
+        # Carry the tail of the finished chunk into the next one so the
+        # boundary between them is not a hard information cut.
+        tail = current[-overlap:].lstrip()
+        current = f"{tail}\n\n{paragraph}" if tail else paragraph
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def load_documents(knowledge_base_dir: Path) -> list[dict[str, str]]:
-    """Load every supported document from the knowledge-base directory.
+def load_documents(knowledge_base_dir: Path = KNOWLEDGE_BASE_DIR) -> list[dict[str, str]]:
+    """Read every .txt file in the knowledge base directory.
 
-    Each item is ``{"source": filename, "text": full document text}``.
-    Empty files are skipped. Unsupported extensions are logged and ignored.
+    Returns one record per file as {"source": filename, "text": contents}.
+    Empty files are skipped.
     """
     if not knowledge_base_dir.is_dir():
-        raise FileNotFoundError(
-            f"Knowledge base directory does not exist: {knowledge_base_dir}"
-        )
+        raise FileNotFoundError(f"Knowledge base directory not found: {knowledge_base_dir}")
 
     documents: list[dict[str, str]] = []
-    for path in sorted(knowledge_base_dir.iterdir()):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        suffix = path.suffix.lower()
-        if suffix in TEXT_EXTENSIONS:
-            text = load_text_file(path)
-        elif suffix in PDF_EXTENSIONS:
-            text = load_pdf_file(path)
-        else:
-            logger.warning("Skipping unsupported file: %s", path.name)
-            continue
-
-        text = text.strip()
+    for path in sorted(knowledge_base_dir.glob("*.txt")):
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
-            logger.warning("Skipping empty document: %s", path.name)
+            print(f"  ! Skipping empty file: {path.name}")
             continue
         documents.append({"source": path.name, "text": text})
-        logger.info("Loaded %s (%d characters)", path.name, len(text))
+        print(f"  - Loaded {path.name} ({len(text):,} characters)")
 
     if not documents:
-        raise ValueError(
-            f"No text or PDF documents found in {knowledge_base_dir}"
-        )
+        raise ValueError(f"No .txt documents found in {knowledge_base_dir}")
     return documents
 
 
-def split_documents(documents: list[dict[str, str]]) -> list[dict[str, str | int]]:
-    """Split each document into overlapping character chunks.
+def build_chunks(documents: list[dict[str, str]]) -> list[dict[str, object]]:
+    """Chunk every document and attach source metadata to each piece.
 
-    Chunk size and overlap come from config (500 / 50). Metadata keeps the
-    source filename and the chunk's position inside that file.
+    Each chunk records which file it came from, its position in that
+    file, and how many chunks that file produced.
     """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-        length_function=len,
-    )
-    chunks: list[dict[str, str | int]] = []
+    chunks: list[dict[str, object]] = []
     for document in documents:
-        pieces = splitter.split_text(document["text"])
+        pieces = chunk_text(document["text"])
+        total = len(pieces)
         for index, piece in enumerate(pieces):
-            piece = piece.strip()
-            if not piece:
-                continue
             chunks.append(
                 {
                     "id": f"{document['source']}::{index}",
                     "text": piece,
                     "source": document["source"],
                     "chunk_index": index,
+                    "total_chunks": total,
                 }
             )
+        print(f"  - {document['source']}: {total} chunk(s)")
+
     if not chunks:
-        raise ValueError("Document splitting produced zero chunks.")
-    logger.info(
-        "Split %d document(s) into %d chunk(s) (size=%d, overlap=%d)",
-        len(documents),
-        len(chunks),
-        settings.chunk_size,
-        settings.chunk_overlap,
-    )
+        raise ValueError("Chunking produced no chunks.")
     return chunks
 
 
-def embed_chunks(chunks: list[dict[str, str | int]]) -> list[list[float]]:
+def embed_chunks(chunks: list[dict[str, object]]) -> list[list[float]]:
     """Embed chunk texts locally with all-MiniLM-L6-v2.
 
-    Vectors are L2-normalized so later cosine similarity is a dot product
-    in the range 0 to 1 for typical queries. The model is downloaded on
-    first use and then loaded from the local Hugging Face cache.
+    Embeddings are L2-normalized so a dot product between any two of
+    them is their cosine similarity.
     """
     texts = [str(chunk["text"]) for chunk in chunks]
-    started = time.perf_counter()
-    try:
-        model = SentenceTransformer(settings.embedding_model_name)
-        vectors = model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to embed {len(texts)} chunk(s) with "
-            f"{settings.embedding_model_name}: {exc}"
-        ) from exc
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info(
-        "Embedded %d chunk(s) with %s in %.0f ms",
-        len(texts),
-        settings.embedding_model_name,
-        elapsed_ms,
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    vectors = model.encode(
+        texts,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        convert_to_numpy=True,
     )
     return vectors.tolist()
 
 
-def store_in_chroma(
-    chunks: list[dict[str, str | int]],
-    embeddings: list[list[float]],
-) -> int:
-    """Replace the Chroma collection with the current chunks and embeddings.
+def store_in_chroma(chunks: list[dict[str, object]], embeddings: list[list[float]]) -> int:
+    """Write chunks and embeddings into a fresh ChromaDB collection.
 
-    Re-ingestion deletes the previous collection first so stale chunks
-    from an older knowledge base cannot be retrieved.
+    Any existing collection is deleted first so a re-ingest can never
+    leave stale chunks from an older version of the documents behind.
     """
-    settings.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(settings.chroma_persist_dir))
-    try:
-        client.delete_collection(settings.collection_name)
-        logger.info("Removed existing collection '%s'", settings.collection_name)
-    except NotFoundError:
-        logger.info("No existing collection '%s' to replace", settings.collection_name)
+    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+
+    existing = [collection.name for collection in client.list_collections()]
+    if COLLECTION_NAME in existing:
+        client.delete_collection(COLLECTION_NAME)
+        print(f"  - Deleted existing collection '{COLLECTION_NAME}'")
 
     collection = client.create_collection(
-        name=settings.collection_name,
+        name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
     collection.add(
@@ -185,65 +187,77 @@ def store_in_chroma(
             {
                 "source": str(chunk["source"]),
                 "chunk_index": int(chunk["chunk_index"]),
+                "total_chunks": int(chunk["total_chunks"]),
             }
             for chunk in chunks
         ],
     )
-    logger.info(
-        "Stored %d chunk(s) in Chroma at %s",
-        len(chunks),
-        settings.chroma_persist_dir,
-    )
-    return len(chunks)
+    return collection.count()
 
 
-def build_bm25_index(chunks: list[dict[str, str | int]]) -> BM25Okapi:
-    """Fit a BM25 index on the same chunks stored in Chroma and save it.
+def build_bm25_index(chunks: list[dict[str, object]]) -> None:
+    """Fit a BM25 index over the same chunks and pickle it to disk.
 
-    The pickle holds the chunk records and the tokenized corpus. Hybrid
-    retrieval rebuilds BM25Okapi from that corpus so the index stays
-    loadable across rank_bm25 versions.
+    The tokenized corpus is stored rather than the fitted object alone,
+    so the index can be rebuilt on load and stays portable across
+    rank_bm25 versions.
     """
     tokenized_corpus = [tokenize(str(chunk["text"])) for chunk in chunks]
     if not any(tokenized_corpus):
         raise ValueError("BM25 corpus is empty after tokenization.")
 
     index = BM25Okapi(tokenized_corpus)
-    settings.bm25_index_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "chunks": chunks,
+        "index": index,
         "tokenized_corpus": tokenized_corpus,
+        "texts": [str(chunk["text"]) for chunk in chunks],
+        "sources": [str(chunk["source"]) for chunk in chunks],
+        "ids": [str(chunk["id"]) for chunk in chunks],
     }
-    with settings.bm25_index_path.open("wb") as handle:
+    BM25_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with BM25_INDEX_PATH.open("wb") as handle:
         pickle.dump(payload, handle)
-    logger.info("Wrote BM25 index to %s", settings.bm25_index_path)
-    return index
 
 
-def ingest(knowledge_base_dir: Path | None = None) -> dict[str, int | str]:
-    """Run the full ingestion pipeline and return a short summary.
+def run_ingestion() -> dict[str, object]:
+    """Run the full pipeline and return a summary of what was indexed."""
+    print("=" * 60)
+    print("KNOWLEDGE BASE INGESTION")
+    print("=" * 60)
 
-    The summary is what the future POST /ingest endpoint will return:
-    how many documents and chunks were indexed, and where they were stored.
-    """
-    settings.configure_logging()
-    directory = knowledge_base_dir or settings.knowledge_base_dir
-    documents = load_documents(directory)
-    chunks = split_documents(documents)
+    print(f"\n[1/5] Loading documents from {KNOWLEDGE_BASE_DIR}")
+    documents = load_documents()
+
+    print(f"\n[2/5] Chunking (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
+    chunks = build_chunks(documents)
+    print(f"  = {len(chunks)} chunk(s) total")
+
+    print(f"\n[3/5] Embedding with {EMBEDDING_MODEL} (local, no API key)")
     embeddings = embed_chunks(chunks)
+    print(f"  = {len(embeddings)} vector(s) of dimension {len(embeddings[0])}")
+
+    print(f"\n[4/5] Storing in ChromaDB at {CHROMA_PERSIST_DIR}")
     stored = store_in_chroma(chunks, embeddings)
+    print(f"  = collection '{COLLECTION_NAME}' holds {stored} chunk(s)")
+
+    print(f"\n[5/5] Building BM25 keyword index at {BM25_INDEX_PATH}")
     build_bm25_index(chunks)
-    summary: dict[str, int | str] = {
+    print("  = BM25 index saved")
+
+    return {
         "documents": len(documents),
-        "chunks": stored,
-        "chroma_persist_dir": str(settings.chroma_persist_dir),
-        "bm25_index_path": str(settings.bm25_index_path),
-        "embedding_model": settings.embedding_model_name,
+        "chunks_stored": stored,
+        "embedding_model": EMBEDDING_MODEL,
+        "chroma_persist_dir": str(CHROMA_PERSIST_DIR),
+        "bm25_index_path": str(BM25_INDEX_PATH),
     }
-    logger.info("Ingestion complete: %s", summary)
-    return summary
 
 
 if __name__ == "__main__":
-    result = ingest()
-    print(result)
+    summary = run_ingestion()
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for key, value in summary.items():
+        print(f"  {key:22} {value}")
+    print("\nIngestion complete.\n")
