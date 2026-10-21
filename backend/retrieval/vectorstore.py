@@ -164,8 +164,10 @@ class HybridRetriever:
         empty: dict[str, object] = {
             "chunks": [],
             "sources": [],
+            "scores": [],
             "confidence": 0.0,
             "query": query,
+            "n_results": n_results,
         }
         if not query or not query.strip():
             return empty
@@ -210,6 +212,7 @@ class HybridRetriever:
 
         chunks = [str(hit["text"]) for hit in ranked]
         sources = [str(hit["source"]) for hit in ranked]
+        scores = [float(hit["combined_score"]) for hit in ranked]
         confidence = self.compute_confidence(query, chunks[0])
 
         logger.info(
@@ -221,8 +224,10 @@ class HybridRetriever:
         return {
             "chunks": chunks,
             "sources": sources,
+            "scores": scores,
             "confidence": confidence,
             "query": query,
+            "n_results": n_results,
         }
 
     def format_context(self, chunks: list[str], sources: list[str]) -> str:
@@ -234,11 +239,11 @@ class HybridRetriever:
         if not chunks:
             return "No relevant information found in the knowledge base."
 
-        sections = []
+        sections = ["RELEVANT INFORMATION:\n"]
         for position, chunk in enumerate(chunks, start=1):
             source = sources[position - 1] if position <= len(sources) else "unknown"
-            sections.append(f"[{position}] (source: {source})\n{chunk}")
-        return "\n\n".join(sections)
+            sections.append(f"From [{source}]:\n{chunk}\n")
+        return "\n".join(sections)
 
 
 _retriever: HybridRetriever | None = None

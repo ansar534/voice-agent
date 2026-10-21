@@ -9,4 +9,9 @@ chroma_db/
 *.egg-info/
 appointments.json
 escalations.json
+calls.json
+call_analytics.json
+support_tickets.json
+phone_settings.json
+audio_cache/
 bm25_index.pkl
