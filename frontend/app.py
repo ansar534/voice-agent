@@ -6,12 +6,20 @@ Start the API first, then run:
 
 from __future__ import annotations
 
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import requests
 import streamlit as st
+
+# Allow `from pages import ...` when Streamlit runs this file directly.
+FRONTEND_ROOT = Path(__file__).resolve().parent
+if str(FRONTEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(FRONTEND_ROOT))
+
+from pages import analytics_dashboard, phone_settings, voice_chat
 
 API_BASE = "http://localhost:8000"
 REQUEST_TIMEOUT = 120
@@ -114,6 +122,19 @@ def render_sidebar() -> None:
                 st.warning("Handed off to a human")
 
         st.divider()
+        health = api_get("/health")
+        if health:
+            st.markdown("### Integrations")
+            st.caption(f"Groq: {'ready' if health.get('groq_key_configured') else 'missing'}")
+            st.caption(
+                f"Deepgram: {'ready' if health.get('deepgram_key_configured') else 'missing'}"
+            )
+            st.caption(
+                f"ElevenLabs: {'ready' if health.get('elevenlabs_key_configured') else 'missing'}"
+            )
+            st.caption(f"Twilio: {'ready' if health.get('twilio_configured') else 'missing'}")
+
+        st.divider()
         if st.button("Start new conversation", use_container_width=True):
             st.session_state["session_id"] = str(uuid.uuid4())
             st.session_state["messages"] = []
@@ -151,7 +172,6 @@ def render_chat_tab() -> None:
                 {"session_id": st.session_state["session_id"], "message": prompt},
             )
         if data is None:
-            # Drop the unanswered message so a retry does not duplicate it.
             st.session_state["messages"].pop()
             return
         st.write(data["response"])
@@ -167,73 +187,23 @@ def render_chat_tab() -> None:
     st.rerun()
 
 
-def render_analytics_tab() -> None:
-    """Show aggregate stats, the intent chart, and booked appointments."""
-    st.markdown("## Analytics")
-
-    header, refresh = st.columns([5, 1])
-    with refresh:
-        if st.button("Refresh", use_container_width=True):
-            st.rerun()
-
-    stats = api_get("/analytics")
-    if stats is None:
-        return
-
-    one, two, three, four = st.columns(4)
-    one.metric("Total Sessions", stats["total_sessions"])
-    two.metric("Top Intent", stats["top_intent"])
-    three.metric("Avg Turns", stats["avg_turns"])
-    four.metric("Escalation Rate", f"{stats['escalation_rate'] * 100:.0f}%")
-
-    five, six, seven = st.columns(3)
-    five.metric("Appointments", stats["total_appointments"])
-    six.metric("Escalations", stats["total_escalations"])
-    seven.metric("Avg Confidence", f"{stats['avg_confidence']:.2f}")
-
-    st.markdown("### Intents")
-    intent_counts = stats.get("intent_counts") or {}
-    if intent_counts:
-        st.bar_chart(pd.DataFrame({"count": intent_counts}))
-    else:
-        st.caption("No conversations yet.")
-
-    st.markdown("### Appointments")
-    appointments = api_get("/appointments")
-    if appointments:
-        st.dataframe(pd.DataFrame(appointments), use_container_width=True, hide_index=True)
-    elif appointments is not None:
-        st.caption("No appointments booked yet.")
-
-    st.markdown("### Escalations")
-    escalations = api_get("/escalations")
-    if escalations:
-        st.dataframe(pd.DataFrame(escalations), use_container_width=True, hide_index=True)
-    elif escalations is not None:
-        st.caption("No escalations logged yet.")
-
-    st.divider()
-    if st.button("Re-ingest Knowledge Base"):
-        with st.spinner("Rebuilding the knowledge base indexes..."):
-            result = api_post("/ingest")
-        if result:
-            st.success(
-                f"Indexed {result['chunks_stored']} chunks from "
-                f"{result['documents']} documents."
-            )
-
-
 def main() -> None:
-    """Draw the dashboard."""
+    """Draw the full four-tab dashboard."""
     init_session_state()
     st.title("AI Voice Agent Dashboard")
 
     render_sidebar()
-    chat_tab, analytics_tab = st.tabs(["Chat", "Analytics"])
+    chat_tab, phone_tab, voice_tab, analytics_tab = st.tabs(
+        ["Chat", "Phone Settings", "Voice Chat", "Advanced Analytics"]
+    )
     with chat_tab:
         render_chat_tab()
+    with phone_tab:
+        phone_settings.show_phone_settings()
+    with voice_tab:
+        voice_chat.show_voice_chat()
     with analytics_tab:
-        render_analytics_tab()
+        analytics_dashboard.show_analytics_dashboard()
 
 
 main()

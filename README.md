@@ -1,9 +1,15 @@
-# AI Voice Agent — Phase 1 (Chat)
+# AI Voice Agent — Complete (Phases 1–4)
 
-Alex is an AI receptionist for a medical clinic. It answers questions from
-a local knowledge base, books appointments, and hands off to a human when
-it isn't confident enough to answer. Phase 1 is chat only; voice and phone
-come later.
+Alex is an AI receptionist for **City Medical Clinic**. It answers questions
+from a local knowledge base, books appointments, speaks over voice and phone,
+and runs post-call automation with analytics.
+
+| Phase | Capability |
+|---|---|
+| 1 | Chat + hybrid RAG + LangGraph agent |
+| 2 | Voice streaming (Deepgram STT + ElevenLabs TTS) |
+| 3 | Phone calls (Twilio webhooks) |
+| 4 | Post-call automation + advanced analytics |
 
 ## Stack
 
@@ -11,26 +17,34 @@ come later.
 |---|---|
 | API | FastAPI + uvicorn |
 | Orchestration | LangGraph `StateGraph` |
-| LLM | Groq, `openai/gpt-oss-20b` (set `GROQ_MODEL` to change) |
+| LLM | Groq (`openai/gpt-oss-20b` by default) |
 | Retrieval | ChromaDB (semantic) + rank_bm25 (keyword) |
-| Embeddings | `all-MiniLM-L6-v2`, runs locally, no API key |
+| Embeddings | `all-MiniLM-L6-v2` (local) |
+| STT | Deepgram nova-2 |
+| TTS | ElevenLabs |
+| Phone / SMS | Twilio |
 | Dashboard | Streamlit |
 
 ## Setup
 
-Requires Python 3.11.
+Requires Python 3.11+.
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .\.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and add your Groq key from
-[console.groq.com](https://console.groq.com/keys):
+Copy `.env.example` to `.env` and fill in keys:
 
 ```
-GROQ_API_KEY=gsk_...
-GROQ_MODEL=openai/gpt-oss-20b
+GROQ_API_KEY=
+DEEPGRAM_API_KEY=
+ELEVENLABS_API_KEY=
+ELEVENLABS_VOICE_ID=Rachel
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_PHONE_NUMBER=
 BUSINESS_NAME=City Medical Clinic
 CHROMA_PERSIST_DIR=./chroma_db
 KNOWLEDGE_BASE_DIR=./data/knowledge_base
@@ -40,83 +54,83 @@ CONFIDENCE_THRESHOLD=0.4
 MAX_HISTORY_TURNS=6
 ```
 
-Groq retired the Llama 3.1 8B endpoints, so the default is
-`openai/gpt-oss-20b`. To see what your key can use:
-`GET https://api.groq.com/openai/v1/models`.
+Free key consoles: [Groq](https://console.groq.com), [Deepgram](https://console.deepgram.com),
+[ElevenLabs](https://elevenlabs.io), [Twilio](https://www.twilio.com) (trial credit).
 
-## Running
+## How to run
 
-Run these in order, in two terminals.
+**1. Index the knowledge base** (once, and after KB changes):
 
-**1. Index the knowledge base.** Required once, and again whenever files in
-`data/knowledge_base/` change:
-
-```powershell
-.\.venv\Scripts\python.exe -m backend.retrieval.ingest
+```bash
+python -m backend.retrieval.ingest
 ```
 
 **2. Start the API** (terminal 1):
 
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn backend.main:app --reload
+```bash
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 **3. Start the dashboard** (terminal 2):
 
-```powershell
-.\.venv\Scripts\python.exe -m streamlit run frontend/app.py
+```bash
+streamlit run frontend/app.py
 ```
 
-The dashboard opens at http://localhost:8501 and the interactive API docs
-are at http://localhost:8000/docs.
+Open http://localhost:8501 — Chat, Phone Settings, Voice Chat, Advanced Analytics.
 
-## How a turn flows
+## Testing order
+
+1. Start with only `GROQ_API_KEY` → test **Chat**
+2. Add Deepgram → test **Voice Chat** transcription
+3. Add ElevenLabs → hear spoken replies
+4. Add Twilio → set webhook to `/phone/incoming`, make a test call
+5. Review **Advanced Analytics**
+
+## Phone setup
+
+1. Buy/get a free Twilio number
+2. Voice webhook: `https://your-domain.com/phone/incoming` (POST)
+3. Optional recording callback: `https://your-domain.com/phone/record`
+4. Forward the clinic number to the Twilio number
+
+## Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/chat` | Text chat turn |
+| GET | `/sessions/{id}/history` | Conversation history |
+| GET | `/appointments` | Bookings |
+| GET | `/escalations` | Human handoffs |
+| GET | `/analytics` | Full dashboard metrics |
+| POST | `/ingest` | Rebuild KB indexes |
+| GET | `/health` | Status + key configuration |
+| POST | `/audio/transcribe` | Deepgram file STT |
+| POST | `/audio/speak` | ElevenLabs TTS (mp3) |
+| POST | `/audio/chat` | Voice turn (STT → agent → TTS) |
+| POST | `/phone/incoming` | Twilio inbound call webhook |
+| POST | `/phone/gather` | Twilio Gather speech callback |
+| POST | `/phone/record` | Voicemail / recording webhook |
+| GET | `/calls` | Call log |
+| GET/PUT | `/phone/settings` | Phone agent toggles |
+| POST | `/phone/test-call` | Outbound Twilio test |
+| GET | `/analytics/transcripts.csv` | Download call transcripts |
+
+## Agent flow
 
 ```
 classify_intent
   faq              -> retrieve_context -> generate_response -> END
                                        -> handle_escalation -> END  (confidence < 0.4)
   book_appointment -> collect_booking_info -> process_booking -> END
-                                           -> END                   (still collecting)
   escalate         -> handle_escalation -> END
   unknown          -> handle_unknown -> classify_intent (one retry) -> END
 ```
 
-Retrieval runs semantic and keyword search together and blends them
-`0.6 * semantic + 0.4 * BM25`. Confidence is the cosine similarity between
-the question and the best chunk. Below `CONFIDENCE_THRESHOLD` the agent
-hands off to staff instead of guessing, and answers are generated only
-from retrieved passages.
-
-The `unknown` branch loops back to `classify_intent` once. The retry is
-capped because re-classifying the same text with no new input would
-otherwise never terminate.
-
-## Endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/chat` | Send a message; empty `session_id` starts a new conversation |
-| GET | `/sessions/{session_id}/history` | Full conversation history |
-| DELETE | `/sessions/{session_id}` | Forget a conversation |
-| GET | `/appointments` | Every booking |
-| GET | `/escalations` | Every handoff to a human |
-| GET | `/analytics` | Dashboard stats |
-| POST | `/ingest` | Rebuild the knowledge base indexes |
-| GET | `/health` | Status and whether a Groq key is configured |
-
-## Data
-
-Knowledge base documents are `.txt` files in `data/knowledge_base/`.
-Bookings go to `appointments.json` and handoffs to `escalations.json`,
-both standing in for a real CRM. Session memory is in-process, so
-restarting the API clears conversations but not the JSON files.
-
 ## Tests
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+```bash
+python -m pytest tests -q
 ```
 
-The tests script the LLM so they run offline and deterministically, but
-they use the real ChromaDB and BM25 indexes. Run ingestion first.
+Run ingestion before pytest so retrieval tests can hit the indexes.

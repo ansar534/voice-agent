@@ -1,20 +1,20 @@
-# FastAPI — async REST API that exposes chat, history, appointments, and analytics.
+# FastAPI — async REST API that exposes chat, voice, phone, and analytics.
 fastapi>=0.115.6
 
 # uvicorn — ASGI server that runs the FastAPI app (the [standard] extra adds httptools and websockets).
 uvicorn[standard]>=0.34.0
 
-# python-dotenv — loads GROQ_API_KEY and other settings from .env into the process environment.
+# python-dotenv — loads API keys and other settings from .env into the process environment.
 python-dotenv>=1.0.1
 
 # pydantic — request and response validation models for every API payload.
 pydantic>=2.10.0
 
-# LangChain — LLM client wrappers and the @tool decorator used by the agent tools.
+# LangChain — LLM client wrappers and utilities used alongside the agent graph.
 langchain>=0.3.14
 langchain-core>=0.3.28
 
-# langchain-groq — Groq chat model (llama-3.1-8b-instruct) behind the LangChain interface.
+# langchain-groq — Groq chat model behind the LangChain interface.
 langchain-groq>=0.2.3
 
 # langchain-community — extra LangChain integrations (document loaders and utilities).
@@ -25,6 +25,9 @@ langchain-text-splitters>=0.3.4
 
 # LangGraph — stateful graph that routes each turn through intent, retrieval, and tools.
 langgraph>=0.2.62
+
+# groq — direct Groq client used by agent nodes.
+groq>=0.13.0
 
 # ChromaDB — local persistent vector database for semantic search.
 chromadb>=0.6.3
@@ -38,9 +41,29 @@ rank-bm25>=0.2.2
 # pypdf — reads PDF files in the knowledge base during ingestion.
 pypdf>=5.1.0
 
-# Streamlit — dark-themed dashboard for chat and analytics.
+# numpy — vector math for embedding similarity / confidence.
+numpy>=1.26.0
+
+# Deepgram — streaming and file speech-to-text (Phase 2).
+deepgram-sdk>=3.0.0
+
+# ElevenLabs — text-to-speech for voice replies (Phase 2).
+elevenlabs>=1.50.0
+
+# Twilio — inbound phone calls, Gather, and SMS confirmations (Phase 3/4).
+twilio>=9.0.0
+
+# Streamlit — dark-themed dashboard for chat, voice, phone, and analytics.
 streamlit>=1.41.1
 
-# pytest + httpx — agent tests and the FastAPI test client.
-pytest>=8.3.4
+# pandas — tables and charts in the Streamlit dashboard.
+pandas>=2.2.0
+
+# requests — HTTP client used by the Streamlit frontend.
+requests>=2.32.0
+
+# httpx — async HTTP client for downloading Twilio recordings.
 httpx>=0.28.0
+
+# pytest — agent tests.
+pytest>=8.3.4
